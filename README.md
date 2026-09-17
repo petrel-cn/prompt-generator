@@ -1,51 +1,38 @@
 # 绘图提示词生成器
 
-把中文描述翻译为英文绘图提示词（text-to-image prompt）的单机 Windows 桌面工具。
+把中文描述翻译为英文绘图提示词（text-to-image prompt）的单机 Windows 桌面工具：写一句中文，拿到可直接喂给绘图模型的英文提示词。
 
-- 单窗口、单轮、无状态：每次生成相互独立，不保留上下文
-- 系统提示词由用户自行编辑，与任何外部工具链无关
-- 独立 API Key（仅支持 DeepSeek），不与外部软件共享
-- 面向本地绘图工作流，忠实翻译成人向（NSFW）内容
+![主界面：中文描述输入、英文提示词输出与状态栏](image/snap01.jpg)
 
-## 构建
+## 特性
 
-零依赖，使用系统自带的 .NET Framework 编译器：
+- **单窗口、单轮、无状态**：每次生成相互独立，不保留上下文
+- **系统提示词可自己改**：`prompt.txt` 纯文本，改完即生效，与任何外部工具链无关
+- **独立 API Key**：仅支持 DeepSeek，不与其它软件共享凭据，密文存储
+- **面向本地绘图工作流**：忠实翻译成人向（NSFW）内容，不做审查与软化
+- **零第三方依赖**：系统自带 `csc.exe` 编译，单文件 `PromptGenerator.exe` 分发
 
-```cmd
-build.cmd
-```
+## 下载与运行
 
-产物：`bin\PromptGenerator.exe`（图标由 `icon\prompt-generator.ico` 经 `/win32icon` 嵌入，资源管理器/任务栏/标题栏均取该图标）
-
-## 运行前提
-
-- Windows 10 / 11（自带 .NET Framework 4.8 运行时）
-- 无需安装 .NET SDK、Node 或任何第三方组件
-
-## 数据目录
-
-```
-%APPDATA%\prompt-generator\
-├── config.json     配置（API Key 为 DPAPI 密文）
-├── prompt.txt      系统提示词（UTF-8 纯文本，可用记事本直接编辑）
-└── saved.json      已保存的提示词（标题 / 中文原文 / 英文提示词 / 时间）
-```
-
-- 首次运行自动创建目录，并写入默认 `prompt.txt`
-- `prompt.txt` 每次生成前重新读取，改完即生效，无需重启；读写时统一归一化为 CRLF 换行（确定性归一化，不影响请求前缀的字节稳定性）
-- API Key 使用 Windows DPAPI（作用域 CurrentUser）加密后以 Base64 存入 `config.json`，不落明文
-- 更换 Windows 用户或机器后无法解密，程序会提示重新输入
+| 项 | 说明 |
+|----|------|
+| 下载 | [Releases](https://github.com/petrel-cn/prompt-generator/releases/latest) 中的 `PromptGenerator.exe` |
+| 运行前提 | Windows 10 / 11（自带 .NET Framework 4.8 运行时） |
+| 安装 | 无需安装：双击即用，无需 .NET SDK、Node 或任何第三方组件 |
+| 首次使用 | 打开「配置」→ 填入 DeepSeek API Key → 回主窗口输入中文 → 点「生成」或按 `Ctrl+Enter` |
 
 ## 界面说明
 
-主窗口：中文描述输入框、英文提示词输出框、`配置 / 生成 / 复制 / 保存 / 查看 / 关于` 六个按钮，底部状态栏显示：
+### 主窗口
+
+中文描述输入框、英文提示词输出框，底部状态栏显示：
 
 ```
 密钥：DeepSeek ｜ 思考：关 ｜ 余额：￥110.00
 ```
 
-- 点击状态栏区域可手动刷新余额
-- 余额状态：`获取中…` / 具体金额 / `获取失败`（悬停可看失败原因）/ `未配置 Key`
+- 按钮：`配置 / 生成 / 复制 / 保存 / 查看 / 关于`
+- 点击状态栏区域可手动刷新余额；余额状态细分 `获取中…` / 具体金额 / `获取失败`（悬停可看失败原因）/ `未配置 Key`
 - 生成期间全部按钮禁用，余额位置显示 `生成中…`
 - 快捷键：`Ctrl+Enter` 触发生成
 - `关于`：显示版本号、版权行（`Copyright (c) 2026 petrel-cn & LanZi`）与 MIT 许可证名/链接，以及“按原样提供”的担保免责提示
@@ -68,11 +55,40 @@ build.cmd
 
 ### 查看对话框
 
-左侧列表显示「标题 + 时间」（空标题显示 `无标题`）；右侧上下分栏，上栏为**中文原文**，下栏为**英文提示词**（旧版本保存的记录没有中文原文，会提示「该记录保存于旧版本」）。可复制英文、删除、关闭；双击列表项把原文与英文一并加载回主窗口。
+左侧列表显示「标题 + 时间」（空标题显示 `无标题`）；右侧上下分栏，上栏为**中文原文**，下栏为**英文提示词**，方便对照与二次修改。
 
-- 左右分隔线可拖动：拖动即可调整左侧标题列表宽度（左栏不小于 140 px、右栏不小于 260 px）；上方中文原文/英文提示词的分隔线同样可拖动
+![查看对话框：左侧标题列表、右侧中文原文与英文提示词对照](image/snap02.jpg)
+
+- 左右分隔线可拖动：拖动即可调整左侧标题列表宽度（左栏不小于 140 px、右栏不小于 260 px）；上方中文原文 / 英文提示词的分隔线同样可拖动
 - 标题过长时列表下方出现横向滚动条，可拖动查看被截断的部分
 - 记录较多时列表出现纵向滚动条，可逐条翻阅全部标题
+- 复制英文、删除、关闭；双击列表项把中文原文与英文提示词一并加载回主窗口
+- 旧版本保存的记录没有中文原文，上栏会提示「该记录保存于旧版本，未保存中文原文」
+
+## 构建
+
+零依赖，使用系统自带的 .NET Framework 编译器：
+
+```cmd
+build.cmd
+```
+
+产物：`bin\PromptGenerator.exe`（图标由 `icon\prompt-generator.ico` 经 `/win32icon` 嵌入，资源管理器 / 任务栏 / 标题栏均取该图标）
+
+## 数据目录
+
+```
+%APPDATA%\prompt-generator\
+├── config.json     配置（API Key 为 DPAPI 密文）
+├── prompt.txt      系统提示词（UTF-8 纯文本，可用记事本直接编辑）
+└── saved.json      已保存的提示词（标题 / 中文原文 / 英文提示词 / 时间）
+```
+
+- 首次运行自动创建目录，并写入默认 `prompt.txt`
+- `prompt.txt` 每次生成前重新读取，改完即生效，无需重启；读写时统一归一化为 CRLF 换行（确定性归一化，不影响请求前缀的字节稳定性）
+- API Key 使用 Windows DPAPI（作用域 CurrentUser）加密后以 Base64 存入 `config.json`，不落明文
+- 更换 Windows 用户或机器后无法解密，程序会提示重新输入
+- 程序目录内不写任何用户状态，卸载时删掉上述文件夹即可
 
 ## 接口
 
@@ -110,9 +126,10 @@ build.cmd
 | `DeepSeekClient.cs` | HTTP 调用层：生成、余额、错误归一化、有限重试 |
 | `Storage.cs` | `config.json` / `prompt.txt` / `saved.json` 读写，DPAPI 加解密 |
 | `JsonUtil.cs` | `JavaScriptSerializer` 薄封装 |
-| `Defaults.cs` | 默认提示词、默认模型名、常量与显示映射 |
+| `Defaults.cs` | 默认提示词、默认模型名、版本号与版权常量、显示映射 |
 | `build.cmd` | 编译脚本（嵌入 `icon\prompt-generator.ico`） |
 | `icon\` | 程序图标源文件（`prompt-generator.ico`） |
+| `image\` | 界面截图（`snap01.jpg` 主界面、`snap02.jpg` 查看对话框） |
 | `tests\` | 离线回归测试（`run.cmd` + `TestMain.cs`） |
 | `LICENSE` | MIT 许可证（英文原文） |
 | `CHANGELOG.md` | 更新日志 |
