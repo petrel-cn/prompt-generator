@@ -1,0 +1,23 @@
+# Build output (the exe is distributed via GitHub Releases, not the repo)
+bin/
+tests/bin/
+
+# Compiler / IDE artifacts
+*.exe
+*.pdb
+*.obj
+*.user
+*.suo
+.vs/
+
+# Local runtime state (never commit user data)
+config.json
+saved.json
+prompt.txt
+*.bad
+*.bak
+*.tmp
+
+# OS junk
+.DS_Store
+Thumbs.db
