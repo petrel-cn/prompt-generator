@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -8,18 +9,34 @@ using System.Windows.Forms;
 namespace PromptGenerator
 {
     /// <summary>
-    /// 主窗口：输入/输出控件、五个按钮的事件编排、状态栏刷新、窗口几何持久化。
+    /// 主窗口：左栏图片上传区 + 右栏输入/输出文本区，七个按钮的事件编排、
+    /// 额外指令 / Pony Mode 标签增删、状态栏刷新、窗口几何持久化。
     /// </summary>
     public class MainForm : Form
     {
+        /// <summary>按钮统一宽度（七个按钮需在一行内排布，最小窗口下也不换行）。</summary>
+        private const int ButtonWidth = 60;
+
         private TextBox _txtInput;
         private TextBox _txtOutput;
+
+        /// <summary>按「字体大小」配置生成的文本区字体（两个文本框共用，替换时释放旧字体）。</summary>
+        private Font _textFont;
+        private CheckBox _chkExtra;
+        private CheckBox _chkPony;
         private Button _btnConfig;
         private Button _btnGenerate;
         private Button _btnCopy;
         private Button _btnSave;
         private Button _btnView;
+        private Button _btnClear;
         private Button _btnAbout;
+
+        private Panel _imagePanel;
+        private Panel _uploadBox;
+        private PictureBox _picPreview;
+        private Label _lblPlus;
+        private Label _lblImageHint;
 
         private StatusStrip _status;
         private ToolStripStatusLabel _lblKey;
@@ -31,8 +48,25 @@ namespace PromptGenerator
         private bool _restoringGeometry;
         private bool _busy;
         private bool _loadingBalance;
+        private bool _suppressTagHandlers;
+        private bool _hasImage;
         private string _balanceText;
         private string _balanceDetail;
+
+        /// <summary>当前上传图片的原始路径（无图为空串）。</summary>
+        private string _currentImagePath;
+
+        /// <summary>当前上传图片的载荷（BMP 已转码，供生成时组装请求体）。</summary>
+        private ImagePayload _imagePayload;
+
+        /// <summary>当前图片的界面预览（与 _picPreview.Image 同源，需成对释放）。</summary>
+        private ImagePreview _preview;
+
+        /// <summary>发起生成时的图片路径快照，保存记录时写入 imagePath。</summary>
+        private string _lastImagePath;
+
+        /// <summary>发起生成时的 Pony 判定快照，保存记录时写入 isPony。</summary>
+        private bool _lastIsPony;
 
         public MainForm()
         {
@@ -40,6 +74,13 @@ namespace PromptGenerator
             _balanceDetail = string.Empty;
             _busy = false;
             _loadingBalance = false;
+            _suppressTagHandlers = false;
+            _hasImage = false;
+            _currentImagePath = string.Empty;
+            _imagePayload = null;
+            _preview = null;
+            _lastImagePath = string.Empty;
+            _lastIsPony = false;
 
             BuildUi();
             ApplyGeometry();
@@ -61,23 +102,158 @@ namespace PromptGenerator
             Size = new Size(Defaults.WindowWidth, Defaults.WindowHeight);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
+            AllowDrop = true;
+            DragEnter += OnDragEnter;
+            DragDrop += OnDragDrop;
 
+            // 内容区：左栏固定宽度图片区 + 右栏文本区
             TableLayoutPanel content = new TableLayoutPanel();
             content.Dock = DockStyle.Fill;
-            content.ColumnCount = 1;
-            content.RowCount = 5;
+            content.ColumnCount = 2;
+            content.RowCount = 1;
             content.Padding = new Padding(10, 8, 10, 6);
+            content.Margin = new Padding(0);
+            content.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Defaults.ImagePanelWidth));
             content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            content.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
-            content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            content.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
-            content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            content.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            content.Controls.Add(BuildImagePanel(), 0, 0);
+            content.Controls.Add(BuildTextPanel(), 1, 0);
+
+            BuildStatusStrip();
+
+            TableLayoutPanel root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill;
+            root.ColumnCount = 1;
+            root.RowCount = 2;
+            root.Margin = new Padding(0);
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            root.Controls.Add(content, 0, 0);
+            root.Controls.Add(_status, 0, 1);
+
+            Controls.Add(root);
+
+            Resize += OnFormResizeOrMove;
+            Move += OnFormResizeOrMove;
+
+            ApplyTextFont();
+        }
+
+        /// <summary>
+        /// 应用「字体大小」配置：只作用于「用户输入」「英文提示词」两个文本框，
+        /// 其余控件与窗口尺寸保持窗体默认字号（9 磅）。
+        /// </summary>
+        private void ApplyTextFont()
+        {
+            Font font = new Font(this.Font.FontFamily,
+                Defaults.NormalizeFontSize(Storage.Config.fontSize), FontStyle.Regular, GraphicsUnit.Point);
+            Font previous = _textFont;
+            _textFont = font;
+            // 先把两个文本框切到新字体，再释放旧字体，避免绘制时引用已释放对象
+            _txtInput.Font = font;
+            _txtOutput.Font = font;
+            if (previous != null)
+            {
+                previous.Dispose();
+            }
+        }
+
+        /// <summary>左栏：固定 250×200 的图片上传框（窗口缩放不改变其尺寸）+ 下方提示文字。</summary>
+        private Control BuildImagePanel()
+        {
+            _imagePanel = new Panel();
+            _imagePanel.Dock = DockStyle.Fill;
+            _imagePanel.Margin = new Padding(0, 0, 10, 0);
+            _imagePanel.Resize += OnImagePanelResize;
+
+            _uploadBox = new Panel();
+            _uploadBox.Size = new Size(Defaults.UploadBoxWidth, Defaults.UploadBoxHeight);
+            _uploadBox.BackColor = SystemColors.Window;
+            _uploadBox.Cursor = Cursors.Hand;
+            _uploadBox.Paint += OnUploadBoxPaint;
+            _uploadBox.Click += OnUploadClick;
+            AttachDropTarget(_uploadBox);
+
+            _picPreview = new PictureBox();
+            _picPreview.Dock = DockStyle.Fill;
+            _picPreview.SizeMode = PictureBoxSizeMode.Zoom;
+            _picPreview.BackColor = SystemColors.Window;
+            _picPreview.Cursor = Cursors.Hand;
+            _picPreview.Visible = false;
+            _picPreview.Click += OnUploadClick;
+            AttachDropTarget(_picPreview);
+
+            // 「＋」用固定尺寸的 Label（不 Dock=Fill，避免遮住父容器的虚线边框）
+            _lblPlus = new Label();
+            _lblPlus.Text = "＋";
+            _lblPlus.Size = new Size(160, 160);
+            _lblPlus.TextAlign = ContentAlignment.MiddleCenter;
+            _lblPlus.BackColor = SystemColors.Window;
+            _lblPlus.ForeColor = SystemColors.ControlDark;
+            _lblPlus.Font = new Font("Microsoft YaHei UI", 40F, FontStyle.Regular, GraphicsUnit.Point);
+            _lblPlus.Cursor = Cursors.Hand;
+            _lblPlus.Click += OnUploadClick;
+            AttachDropTarget(_lblPlus);
+
+            _uploadBox.Controls.Add(_picPreview);
+            _uploadBox.Controls.Add(_lblPlus);
+
+            _lblImageHint = new Label();
+            _lblImageHint.Text = "点击上传图片\r\n或将图片拖动至此";
+            _lblImageHint.TextAlign = ContentAlignment.MiddleCenter;
+            _lblImageHint.AutoSize = false;
+            _lblImageHint.Cursor = Cursors.Hand;
+            _lblImageHint.Click += OnUploadClick;
+            AttachDropTarget(_lblImageHint);
+
+            _imagePanel.Controls.Add(_uploadBox);
+            _imagePanel.Controls.Add(_lblImageHint);
+            return _imagePanel;
+        }
+
+        /// <summary>右栏：头部（用户输入 + 两个复选框）/ 输入 / 输出标题 / 输出 / 按钮行。</summary>
+        private Control BuildTextPanel()
+        {
+            TableLayoutPanel panel = new TableLayoutPanel();
+            panel.Dock = DockStyle.Fill;
+            panel.ColumnCount = 1;
+            panel.RowCount = 5;
+            panel.Margin = new Padding(0);
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            panel.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
+            panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            panel.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
+            panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+            FlowLayoutPanel header = new FlowLayoutPanel();
+            header.AutoSize = true;
+            header.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            header.WrapContents = false;
+            header.Margin = new Padding(0);
+            header.Padding = new Padding(0);
 
             Label lblInput = new Label();
-            lblInput.Text = "中文描述";
+            lblInput.Text = "用户输入";
             lblInput.AutoSize = true;
-            lblInput.Margin = new Padding(0, 2, 0, 4);
+            lblInput.Margin = new Padding(0, 6, 20, 0);
+
+            _chkExtra = new CheckBox();
+            _chkExtra.Text = "额外指令";
+            _chkExtra.AutoSize = true;
+            _chkExtra.Margin = new Padding(0, 4, 20, 0);
+            _chkExtra.CheckedChanged += OnExtraCheckedChanged;
+
+            _chkPony = new CheckBox();
+            _chkPony.Text = "Pony Mode";
+            _chkPony.AutoSize = true;
+            _chkPony.Margin = new Padding(0, 4, 0, 0);
+            _chkPony.CheckedChanged += OnPonyCheckedChanged;
+
+            header.Controls.Add(lblInput);
+            header.Controls.Add(_chkExtra);
+            header.Controls.Add(_chkPony);
 
             _txtInput = new TextBox();
             _txtInput.Multiline = true;
@@ -103,56 +279,43 @@ namespace PromptGenerator
             _txtOutput.Margin = new Padding(0, 0, 0, 8);
 
             FlowLayoutPanel buttons = new FlowLayoutPanel();
-            buttons.Dock = DockStyle.Fill;
             buttons.AutoSize = true;
+            buttons.AutoSizeMode = AutoSizeMode.GrowAndShrink;
             buttons.WrapContents = false;
             buttons.Margin = new Padding(0);
+            buttons.Padding = new Padding(0);
 
-            _btnConfig = CreateButton("配置", 84, OnConfigClick);
-            _btnGenerate = CreateButton("生成", 84, OnGenerateClick);
-            _btnCopy = CreateButton("复制", 84, OnCopyClick);
-            _btnSave = CreateButton("保存", 84, OnSaveClick);
-            _btnView = CreateButton("查看", 84, OnViewClick);
-            _btnAbout = CreateButton("关于", 84, OnAboutClick);
+            _btnConfig = CreateButton("配置", OnConfigClick);
+            _btnGenerate = CreateButton("生成", OnGenerateClick);
+            _btnCopy = CreateButton("复制", OnCopyClick);
+            _btnSave = CreateButton("保存", OnSaveClick);
+            _btnView = CreateButton("查看", OnViewClick);
+            _btnClear = CreateButton("清除", OnClearClick);
+            _btnAbout = CreateButton("关于", OnAboutClick);
 
             buttons.Controls.Add(_btnConfig);
             buttons.Controls.Add(_btnGenerate);
             buttons.Controls.Add(_btnCopy);
             buttons.Controls.Add(_btnSave);
             buttons.Controls.Add(_btnView);
+            buttons.Controls.Add(_btnClear);
             buttons.Controls.Add(_btnAbout);
 
-            content.Controls.Add(lblInput, 0, 0);
-            content.Controls.Add(_txtInput, 0, 1);
-            content.Controls.Add(lblOutput, 0, 2);
-            content.Controls.Add(_txtOutput, 0, 3);
-            content.Controls.Add(buttons, 0, 4);
-
-            BuildStatusStrip();
-
-            TableLayoutPanel root = new TableLayoutPanel();
-            root.Dock = DockStyle.Fill;
-            root.ColumnCount = 1;
-            root.RowCount = 2;
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            root.Controls.Add(content, 0, 0);
-            root.Controls.Add(_status, 0, 1);
-
-            Controls.Add(root);
-
-            Resize += OnFormResizeOrMove;
-            Move += OnFormResizeOrMove;
+            panel.Controls.Add(header, 0, 0);
+            panel.Controls.Add(_txtInput, 0, 1);
+            panel.Controls.Add(lblOutput, 0, 2);
+            panel.Controls.Add(_txtOutput, 0, 3);
+            panel.Controls.Add(buttons, 0, 4);
+            return panel;
         }
 
-        private Button CreateButton(string text, int width, EventHandler handler)
+        private static Button CreateButton(string text, EventHandler handler)
         {
             Button button = new Button();
             button.Text = text;
-            button.Width = width;
+            button.Width = ButtonWidth;
             button.Height = 28;
-            button.Margin = new Padding(0, 0, 8, 0);
+            button.Margin = new Padding(0, 0, 4, 0);
             button.Click += handler;
             return button;
         }
@@ -189,6 +352,65 @@ namespace PromptGenerator
             _status.Items.Add(sep2);
             _status.Items.Add(_lblBalance);
             _status.Click += OnStatusClick;
+        }
+
+        /// <summary>
+        /// 图片区自适应：上传框恒为 250×200 并水平居中，整体在左栏内垂直居中；
+        /// 窗口缩放只改变留白，不改变上传框尺寸。
+        /// </summary>
+        private void LayoutImageArea()
+        {
+            if (_imagePanel == null || _uploadBox == null || _lblImageHint == null)
+            {
+                return;
+            }
+
+            int boxWidth = Defaults.UploadBoxWidth;
+            int boxHeight = Defaults.UploadBoxHeight;
+            int gap = 12;
+            int hintHeight = _lblImageHint.Font.Height * 2 + 8;
+
+            int total = boxHeight + gap + hintHeight;
+            int top = (_imagePanel.ClientSize.Height - total) / 2;
+            if (top < 6)
+            {
+                top = 6;
+            }
+            int left = (_imagePanel.ClientSize.Width - boxWidth) / 2;
+            if (left < 0)
+            {
+                left = 0;
+            }
+
+            _uploadBox.Location = new Point(left, top);
+            _uploadBox.Size = new Size(boxWidth, boxHeight);
+            _lblImageHint.Location = new Point(left, top + boxHeight + gap);
+            _lblImageHint.Size = new Size(boxWidth, hintHeight);
+
+            if (_lblPlus != null)
+            {
+                _lblPlus.Location = new Point(
+                    (boxWidth - _lblPlus.Width) / 2,
+                    (boxHeight - _lblPlus.Height) / 2);
+            }
+        }
+
+        /// <summary>无图时绘制虚线边框；有图时由 PictureBox 覆盖整个上传框。</summary>
+        private void OnUploadBoxPaint(object sender, PaintEventArgs e)
+        {
+            if (_hasImage)
+            {
+                return;
+            }
+            Rectangle rect = new Rectangle(0, 0, _uploadBox.Width - 1, _uploadBox.Height - 1);
+            ControlPaint.DrawBorder(e.Graphics, rect, Color.Silver, ButtonBorderStyle.Dashed);
+        }
+
+        private void AttachDropTarget(Control control)
+        {
+            control.AllowDrop = true;
+            control.DragEnter += OnDragEnter;
+            control.DragDrop += OnDragDrop;
         }
 
         #endregion
@@ -317,6 +539,137 @@ namespace PromptGenerator
                 _geomTimer = null;
             }
             SaveGeometry();
+            DetachPreview();
+        }
+
+        #endregion
+
+        #region 图片上传
+
+        private void OnImagePanelResize(object sender, EventArgs e)
+        {
+            LayoutImageArea();
+        }
+
+        private void OnUploadClick(object sender, EventArgs e)
+        {
+            if (_busy)
+            {
+                return;
+            }
+            using (OpenFileDialog dialog = new OpenFileDialog())
+            {
+                dialog.Title = "选择图片";
+                dialog.Filter = ImageUtil.OpenFileFilter;
+                dialog.CheckFileExists = true;
+                dialog.Multiselect = false;
+                if (dialog.ShowDialog(this) != DialogResult.OK)
+                {
+                    return;
+                }
+                SetImage(dialog.FileName);
+            }
+        }
+
+        private void OnDragEnter(object sender, DragEventArgs e)
+        {
+            e.Effect = DragDropEffects.None;
+            if (e.Data == null || !e.Data.GetDataPresent(DataFormats.FileDrop))
+            {
+                return;
+            }
+            string[] files = e.Data.GetData(DataFormats.FileDrop) as string[];
+            if (files == null || files.Length == 0)
+            {
+                return;
+            }
+            if (ImageUtil.IsSupportedExtension(files[0]))
+            {
+                e.Effect = DragDropEffects.Copy;
+            }
+        }
+
+        private void OnDragDrop(object sender, DragEventArgs e)
+        {
+            if (_busy || e.Data == null || !e.Data.GetDataPresent(DataFormats.FileDrop))
+            {
+                return;
+            }
+            string[] files = e.Data.GetData(DataFormats.FileDrop) as string[];
+            if (files == null || files.Length == 0)
+            {
+                return;
+            }
+            // 仅支持单张：多选时取第一个文件
+            SetImage(files[0]);
+        }
+
+        /// <summary>加载图片（校验失败时提示并保持当前图片不变）。</summary>
+        private void SetImage(string path)
+        {
+            ImagePayload payload;
+            string error;
+            if (!ImageUtil.LoadForUpload(path, out payload, out error))
+            {
+                MessageBox.Show(this, error, "绘图提示词生成器",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // 预览解码失败（例如 GDI+ 不支持的 WebP）不影响上传与生成
+            ImagePreview preview;
+            string previewError;
+            if (!ImageUtil.TryCreatePreview(payload, out preview, out previewError))
+            {
+                preview = null;
+            }
+
+            DetachPreview();
+
+            _imagePayload = payload;
+            _currentImagePath = path;
+            _preview = preview;
+            _hasImage = preview != null;
+
+            if (_preview != null)
+            {
+                _picPreview.Image = _preview.Image;
+                _picPreview.Visible = true;
+                _lblPlus.Visible = false;
+            }
+            else
+            {
+                _picPreview.Image = null;
+                _picPreview.Visible = false;
+                _lblPlus.Visible = true;
+            }
+            _uploadBox.Invalidate();
+        }
+
+        /// <summary>清空图片（内存中的载荷、预览与路径）。</summary>
+        private void ClearImage()
+        {
+            DetachPreview();
+            _imagePayload = null;
+            _currentImagePath = string.Empty;
+            _hasImage = false;
+            _picPreview.Visible = false;
+            _lblPlus.Visible = true;
+            _uploadBox.Invalidate();
+        }
+
+        /// <summary>释放预览图像；必须先断开 PictureBox 的引用再释放。</summary>
+        private void DetachPreview()
+        {
+            if (_picPreview != null)
+            {
+                _picPreview.Image = null;
+            }
+            if (_preview != null)
+            {
+                _preview.Dispose();
+                _preview = null;
+            }
         }
 
         #endregion
@@ -325,6 +678,7 @@ namespace PromptGenerator
 
         private void OnFormLoad(object sender, EventArgs e)
         {
+            LayoutImageArea();
             RefreshStatusLabels();
             RefreshBalance();
 
@@ -366,6 +720,8 @@ namespace PromptGenerator
                 RefreshStatusLabels();
                 if (result == DialogResult.OK)
                 {
+                    // 只有落盘成功才应用新字号，避免「保存失败」后界面与配置文件不一致
+                    ApplyTextFont();
                     RefreshBalance();
                 }
                 else
@@ -375,6 +731,60 @@ namespace PromptGenerator
             }
         }
 
+        #region 额外指令 / Pony Mode 标签
+
+        private void OnExtraCheckedChanged(object sender, EventArgs e)
+        {
+            if (_suppressTagHandlers)
+            {
+                return;
+            }
+            string text = _txtInput.Text;
+            if (_chkExtra.Checked)
+            {
+                ApplyTagText(Defaults.AppendExtraInstruction(text));
+            }
+            else
+            {
+                ApplyTagText(Defaults.RemoveExtraInstruction(text));
+            }
+        }
+
+        private void OnPonyCheckedChanged(object sender, EventArgs e)
+        {
+            if (_suppressTagHandlers)
+            {
+                return;
+            }
+            string text = _txtInput.Text;
+            if (_chkPony.Checked)
+            {
+                ApplyTagText(Defaults.AppendPonyMode(text));
+            }
+            else
+            {
+                ApplyTagText(Defaults.RemovePonyMode(text));
+            }
+        }
+
+        /// <summary>写入标签改动后的文本并把光标移到末尾（抑制复选框事件递归触发）。</summary>
+        private void ApplyTagText(string text)
+        {
+            _suppressTagHandlers = true;
+            try
+            {
+                _txtInput.Text = text == null ? string.Empty : text;
+                _txtInput.SelectionStart = _txtInput.TextLength;
+                _txtInput.SelectionLength = 0;
+            }
+            finally
+            {
+                _suppressTagHandlers = false;
+            }
+        }
+
+        #endregion
+
         private void OnGenerateClick(object sender, EventArgs e)
         {
             if (_busy)
@@ -383,9 +793,10 @@ namespace PromptGenerator
             }
 
             string input = _txtInput.Text.Trim();
-            if (input.Length == 0)
+            bool hasImage = _imagePayload != null && _imagePayload.Length > 0;
+            if (input.Length == 0 && !hasImage)
             {
-                MessageBox.Show(this, "请先输入中文描述。", "绘图提示词生成器",
+                MessageBox.Show(this, "请先输入描述或上传图片。", "绘图提示词生成器",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 _txtInput.Focus();
                 return;
@@ -428,6 +839,11 @@ namespace PromptGenerator
                 }
             }
 
+            // 本次生成的图片与 Pony 属性在此快照，供「保存」写入记录
+            _lastIsPony = Defaults.ContainsPonyMode(_txtInput.Text);
+            _lastImagePath = hasImage ? _currentImagePath : string.Empty;
+            ImagePayload payload = hasImage ? _imagePayload : null;
+
             DeepSeekClient client = new DeepSeekClient(cfg.apiKeyPlain, cfg.model, cfg.thinking);
 
             SetBusy(true);
@@ -437,7 +853,7 @@ namespace PromptGenerator
                 GenerateResult result = null;
                 try
                 {
-                    result = client.Generate(systemPrompt, input);
+                    result = client.Generate(systemPrompt, input, payload);
                 }
                 catch (Exception ex)
                 {
@@ -456,7 +872,7 @@ namespace PromptGenerator
         {
             if (result.Success)
             {
-                _txtOutput.Text = result.Content;
+                _txtOutput.Text = Defaults.ToDisplayNewlines(result.Content);
                 _txtOutput.SelectionStart = 0;
                 _txtOutput.SelectionLength = 0;
                 RefreshBalance();
@@ -479,10 +895,10 @@ namespace PromptGenerator
 
         private void OnCopyClick(object sender, EventArgs e)
         {
-            string text = _txtOutput.Text;
+            string text = Defaults.ToUnixNewlines(_txtOutput.Text);
             if (text == null || text.Trim().Length == 0)
             {
-                MessageBox.Show(this, "没有可复制的内容，请先生成英文提示词。", "绘图提示词生成器",
+                MessageBox.Show(this, "没有可复制的内容，请先生成提示词。", "绘图提示词生成器",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -518,10 +934,10 @@ namespace PromptGenerator
 
         private void OnSaveClick(object sender, EventArgs e)
         {
-            string content = _txtOutput.Text;
+            string content = Defaults.ToUnixNewlines(_txtOutput.Text);
             if (content == null || content.Trim().Length == 0)
             {
-                MessageBox.Show(this, "没有可保存的内容，请先生成英文提示词。", "绘图提示词生成器",
+                MessageBox.Show(this, "没有可保存的内容，请先生成提示词。", "绘图提示词生成器",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -547,9 +963,14 @@ namespace PromptGenerator
 
                     SavedEntry entry = new SavedEntry();
                     entry.title = dialog.EntryTitle == null ? string.Empty : dialog.EntryTitle;
+                    // content 与 title 原样保存，<Pony> 前缀只在列表显示时按 isPony 派生
                     entry.content = content;
                     entry.source = _txtInput.Text.Trim();
                     entry.time = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+                    entry.imagePath = _lastImagePath == null ? string.Empty : _lastImagePath;
+                    entry.isPony = _lastIsPony;
+                    entry.thumbFile = CreateThumbnail(entry.imagePath);
+
                     entries.Add(entry);
                     Storage.SaveSaved(entries);
 
@@ -562,6 +983,48 @@ namespace PromptGenerator
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
+        }
+
+        /// <summary>
+        /// 为带图记录生成缩略图（thumbs\&lt;guid&gt;.png）。
+        /// 原图被移动/删除或解码失败时返回空串，保存流程照常完成。
+        /// </summary>
+        private static string CreateThumbnail(string imagePath)
+        {
+            if (string.IsNullOrEmpty(imagePath))
+            {
+                return string.Empty;
+            }
+            string fileName = ImageUtil.NewThumbFileName();
+            string target = Path.Combine(Storage.ThumbsDir, fileName);
+            if (ImageUtil.TryCreateThumbnail(imagePath, target))
+            {
+                return fileName;
+            }
+            return string.Empty;
+        }
+
+        /// <summary>清除图片、输入、输出与两个复选框的勾选状态（无二次确认）。</summary>
+        private void OnClearClick(object sender, EventArgs e)
+        {
+            ClearImage();
+
+            _suppressTagHandlers = true;
+            try
+            {
+                _chkExtra.Checked = false;
+                _chkPony.Checked = false;
+            }
+            finally
+            {
+                _suppressTagHandlers = false;
+            }
+
+            _txtInput.Clear();
+            _txtOutput.Clear();
+            _lastImagePath = string.Empty;
+            _lastIsPony = false;
+            _txtInput.Focus();
         }
 
         private void OnAboutClick(object sender, EventArgs e)
@@ -580,13 +1043,17 @@ namespace PromptGenerator
             {
                 using (ViewForm form = new ViewForm(delegate(string content, string source)
                 {
-                    _txtOutput.Text = content == null ? string.Empty : content;
+                    _txtOutput.Text = content == null ? string.Empty : Defaults.ToDisplayNewlines(content);
                     _txtOutput.SelectionStart = 0;
                     _txtOutput.SelectionLength = 0;
                     if (!string.IsNullOrEmpty(source))
                     {
                         _txtInput.Text = source;
                     }
+                    // 回填不携带图片，同时按回填文本重算 Pony 属性，
+                    // 使随后保存的记录与当前文本一致
+                    _lastImagePath = string.Empty;
+                    _lastIsPony = Defaults.ContainsPonyMode(_txtInput.Text);
                     _txtOutput.Focus();
                 }))
                 {
@@ -620,6 +1087,7 @@ namespace PromptGenerator
             _btnCopy.Enabled = !busy;
             _btnSave.Enabled = !busy;
             _btnView.Enabled = !busy;
+            _btnClear.Enabled = !busy;
             _btnAbout.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
             _btnGenerate.Text = busy ? "生成中…" : "生成";
@@ -710,5 +1178,16 @@ namespace PromptGenerator
         }
 
         #endregion
+
+        /// <summary>窗口销毁时释放本窗口创建的文本区字体（必须在 base.Dispose 之后，避免拆除期重绘引用已释放字体）。</summary>
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+            if (disposing && _textFont != null)
+            {
+                _textFont.Dispose();
+                _textFont = null;
+            }
+        }
     }
 }

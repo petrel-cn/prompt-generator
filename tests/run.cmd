@@ -11,10 +11,11 @@ if not exist bin mkdir bin
 "%CSC%" /nologo /target:exe /out:bin\verify.exe ^
   /r:System.dll ^
   /r:System.Core.dll ^
+  /r:System.Drawing.dll ^
   /r:System.Web.Extensions.dll ^
   /r:System.Security.dll ^
   TestMain.cs ^
-  %SRC%\Defaults.cs %SRC%\JsonUtil.cs %SRC%\DeepSeekClient.cs %SRC%\Storage.cs
+  %SRC%\Defaults.cs %SRC%\JsonUtil.cs %SRC%\DeepSeekClient.cs %SRC%\ImageUtil.cs %SRC%\Storage.cs
 
 if errorlevel 1 (
   echo TEST BUILD FAILED

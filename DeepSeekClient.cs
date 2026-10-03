@@ -71,10 +71,20 @@ namespace PromptGenerator
         }
 
         /// <summary>
-        /// 生成英文提示词。系统提示词作为 messages 的第一条且逐字节不变（缓存友好），
+        /// 生成英文提示词（无图片）。系统提示词作为 messages 的第一条且逐字节不变（缓存友好），
         /// system 与 user 之间不插入任何额外消息。
         /// </summary>
         public GenerateResult Generate(string systemPrompt, string userText)
+        {
+            return Generate(systemPrompt, userText, null);
+        }
+
+        /// <summary>
+        /// 生成英文提示词。无图片时 user 的 content 为字符串（与 1.x 逐字节一致）；
+        /// 有图片时 content 变为内容块数组（文本块在前、image_url 块固定放最后），
+        /// 不传 detail，也不做本地缩放（由服务端处理）。
+        /// </summary>
+        public GenerateResult Generate(string systemPrompt, string userText, ImagePayload image)
         {
             GenerateResult result = new GenerateResult();
             if (string.IsNullOrEmpty(_apiKey))
@@ -84,7 +94,7 @@ namespace PromptGenerator
                 return result;
             }
 
-            Dictionary<string, object> body = BuildChatBody(systemPrompt, userText);
+            Dictionary<string, object> body = BuildChatBody(systemPrompt, userText, image);
             string json = JsonUtil.Serialize(body);
 
             HttpOutcome outcome = ExecuteWithRetry(Defaults.ChatUrl, "POST", json);
@@ -144,8 +154,11 @@ namespace PromptGenerator
             return result;
         }
 
-        /// <summary>组装请求体。thinking 为 DeepSeek 扩展字段：关闭思考后采样参数才生效。</summary>
-        private Dictionary<string, object> BuildChatBody(string systemPrompt, string userText)
+        /// <summary>
+        /// 组装请求体。thinking 为 DeepSeek 扩展字段：关闭思考后采样参数才生效。
+        /// 图片只能放在 user 消息；无图片时保持字符串 content（前缀缓存友好）。
+        /// </summary>
+        private Dictionary<string, object> BuildChatBody(string systemPrompt, string userText, ImagePayload image)
         {
             Dictionary<string, object> body = new Dictionary<string, object>();
             body["model"] = _model;
@@ -157,9 +170,36 @@ namespace PromptGenerator
             systemMessage["content"] = systemPrompt == null ? string.Empty : systemPrompt;
             messages.Add(systemMessage);
 
+            string text = userText == null ? string.Empty : userText;
+
             Dictionary<string, object> userMessage = new Dictionary<string, object>();
             userMessage["role"] = "user";
-            userMessage["content"] = userText == null ? string.Empty : userText;
+            if (image == null || image.Length == 0)
+            {
+                userMessage["content"] = text;
+            }
+            else
+            {
+                List<object> blocks = new List<object>();
+                if (text.Length > 0)
+                {
+                    // 用户文本非空时，第一个块为 text；为空（仅图片反推）时不加文本块
+                    Dictionary<string, object> textBlock = new Dictionary<string, object>();
+                    textBlock["type"] = "text";
+                    textBlock["text"] = text;
+                    blocks.Add(textBlock);
+                }
+
+                Dictionary<string, object> imageUrl = new Dictionary<string, object>();
+                imageUrl["url"] = image.ToDataUrl();
+
+                Dictionary<string, object> imageBlock = new Dictionary<string, object>();
+                imageBlock["type"] = "image_url";
+                imageBlock["image_url"] = imageUrl;
+                blocks.Add(imageBlock);
+
+                userMessage["content"] = blocks;
+            }
             messages.Add(userMessage);
 
             body["messages"] = messages;
@@ -214,7 +254,7 @@ namespace PromptGenerator
                 request.Timeout = Defaults.TimeoutMs;
                 request.ReadWriteTimeout = Defaults.TimeoutMs;
                 request.KeepAlive = false;
-                request.UserAgent = "PromptGenerator/1.0";
+                request.UserAgent = "PromptGenerator/" + Defaults.AppVersion;
 
                 if (string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase))
                 {

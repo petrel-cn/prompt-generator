@@ -1,24 +1,31 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using PromptGenerator;
 
 /// <summary>
-/// 离线回归测试。直接编译项目源码（Defaults / JsonUtil / DeepSeekClient / Storage），
+/// 离线回归测试。直接编译项目源码（Defaults / JsonUtil / DeepSeekClient / ImageUtil / Storage），
 /// 不联网、不触碰 %APPDATA%，可反复执行。
 ///
 /// 覆盖范围：
 ///   - JSON 序列化/反序列化（含中文与 emoji 保真、[ScriptIgnore] 不泄露明文 Key）
 ///   - 生成响应解析（choices[0].message.content）
+///   - 文本 / 图片请求体组装（内容块数组、data URL、不传 detail）
 ///   - 余额解析与币种符号映射
 ///   - HTTP 错误归一化与重试判定
 ///   - prompt.txt 换行归一化
 ///   - 数据文件原子写（失败不丢旧内容）
 ///   - DPAPI 加解密
+///   - 额外指令 / Pony Mode 标签增删
+///   - 图片格式校验、BMP 转 PNG、缩略图尺寸与文件名
+///   - config.json（schemaVersion / viewWindow）与 saved.json（imagePath / thumbFile / isPony）新旧兼容
 ///
 /// 未覆盖（需人工验证）：WinForms 界面、真实 API 往返、跨用户 DPAPI 场景。
 /// </summary>
@@ -31,12 +38,18 @@ internal static class TestMain
     {
         Console.OutputEncoding = Encoding.UTF8;
 
+        ConstantsTests();
         JsonTests();
         NewlineTests();
         SavedEntryTests();
+        ConfigTests();
+        TagTests();
         AsStringTests();
         ParseTests();
+        ImageRequestTests();
+        ImageUtilTests();
         RetryTests();
+        RemoveEntryTests();
         AtomicWriteTests();
         DpapiTests();
 
@@ -58,6 +71,74 @@ internal static class TestMain
             Console.WriteLine("[FAIL] " + name + " -> " + detail);
         }
     }
+
+    /// <summary>把换行与制表符转成可见形式，便于失败时定位。</summary>
+    private static string Escape(string text)
+    {
+        if (text == null)
+        {
+            return "<null>";
+        }
+        return text.Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t");
+    }
+
+    #region 常量与默认值
+
+    private static void ConstantsTests()
+    {
+        Check("版本号为 2.1.0", Defaults.AppVersion == "2.1.0", Defaults.AppVersion);
+        Check("配置结构版本为 2", Defaults.SchemaVersion == 2, Defaults.SchemaVersion.ToString());
+        Check("额外指令标签常量", Defaults.ExtraInstructionTag == "<额外指令>:", Defaults.ExtraInstructionTag);
+        Check("Pony Mode 标签常量", Defaults.PonyModeTag == "<Pony Mode>", Defaults.PonyModeTag);
+        Check("Pony 显示前缀常量", Defaults.PonyDisplayPrefix == "<Pony> ", Defaults.PonyDisplayPrefix);
+        Check("缩略图上限为 250×200",
+            Defaults.ThumbMaxWidth == 250 && Defaults.ThumbMaxHeight == 200,
+            Defaults.ThumbMaxWidth + "x" + Defaults.ThumbMaxHeight);
+        Check("上传框固定 250×200",
+            Defaults.UploadBoxWidth == 250 && Defaults.UploadBoxHeight == 200,
+            Defaults.UploadBoxWidth + "x" + Defaults.UploadBoxHeight);
+        Check("主窗口默认 920×640",
+            Defaults.WindowWidth == 920 && Defaults.WindowHeight == 640,
+            Defaults.WindowWidth + "x" + Defaults.WindowHeight);
+        Check("主窗口最小 780×520",
+            Defaults.WindowMinWidth == 780 && Defaults.WindowMinHeight == 520,
+            Defaults.WindowMinWidth + "x" + Defaults.WindowMinHeight);
+        Check("查看窗口默认 800×800",
+            Defaults.ViewWindowWidth == 800 && Defaults.ViewWindowHeight == 800,
+            Defaults.ViewWindowWidth + "x" + Defaults.ViewWindowHeight);
+        Check("thumbs 目录位于应用目录下",
+            Storage.ThumbsDir == Path.Combine(Storage.AppDir, "thumbs"),
+            Storage.ThumbsDir);
+
+        // 字号：基准 9 磅，可选 N、N+1 … N+4 共 5 档
+        Check("字号基准 9 磅、5 档、上限 13",
+            Defaults.FontSizeBase == 9 && Defaults.FontSizeOptionCount == 5 && Defaults.FontSizeMax == 13,
+            Defaults.FontSizeBase + "/" + Defaults.FontSizeOptionCount + "/" + Defaults.FontSizeMax);
+        Check("字号归一化：N…N+4 保持原值",
+            Defaults.NormalizeFontSize(9) == 9 && Defaults.NormalizeFontSize(11) == 11
+            && Defaults.NormalizeFontSize(13) == 13, "取值被改动");
+        Check("字号归一化：缺省值 0 回落基准",
+            Defaults.NormalizeFontSize(0) == Defaults.FontSizeBase, Defaults.NormalizeFontSize(0).ToString());
+        Check("字号归一化：超上限钳制到上限",
+            Defaults.NormalizeFontSize(99) == Defaults.FontSizeMax, Defaults.NormalizeFontSize(99).ToString());
+        Check("字号显示名（基准带默认标注）",
+            Defaults.FontSizeDisplayName(9) == "9 磅（默认）" && Defaults.FontSizeDisplayName(10) == "10 磅"
+            && Defaults.FontSizeDisplayName(13) == "13 磅",
+            Defaults.FontSizeDisplayName(9) + "/" + Defaults.FontSizeDisplayName(13));
+
+        // 默认提示词为综合版英文：多段、含两种模式说明
+        Check("默认提示词含 Pony Mode 说明",
+            Defaults.DefaultSystemPrompt.IndexOf("<Pony Mode>") >= 0, "缺失");
+        Check("默认提示词含额外指令说明",
+            Defaults.DefaultSystemPrompt.IndexOf("<额外指令>") >= 0, "缺失");
+        Check("默认提示词含图片反推说明",
+            Defaults.DefaultSystemPrompt.IndexOf("reverse-engineer") >= 0, "缺失");
+        Check("默认提示词以英文说明开头",
+            Defaults.DefaultSystemPrompt.StartsWith("You are a professional prompt generator"),
+            Defaults.DefaultSystemPrompt.Substring(0, 40));
+    }
+
+    #endregion
 
     #region JsonUtil
 
@@ -180,7 +261,7 @@ internal static class TestMain
     private static void CHECK_NEWLINES(string name, string input, string expected)
     {
         string actual = Storage.NormalizeNewlines(input);
-        Check("换行归一化：" + name, actual == expected, "得到 [" + actual.Replace("\r", "\\r").Replace("\n", "\\n") + "]");
+        Check("换行归一化：" + name, actual == expected, "得到 [" + Escape(actual) + "]");
     }
 
     #endregion
@@ -189,7 +270,7 @@ internal static class TestMain
 
     private static void SavedEntryTests()
     {
-        // 含中文原文的新格式
+        // 含用户输入原文的新格式
         string json = "[{\"title\":\"窗台上的白猫\",\"content\":\"a white cat\",\"source\":\"窗台上的白猫，赛博朋克配色\",\"time\":\"2026-09-17 13:36\"}]";
         List<SavedEntry> entries = JsonUtil.Deserialize<List<SavedEntry>>(json);
         Check("saved.json 新格式（含 source）可反序列化",
@@ -214,6 +295,245 @@ internal static class TestMain
         entry.title = "";
         entry.time = "2026-09-17 13:36";
         Check("空标题显示为 无标题", entry.Display == "无标题（2026-09-17 13:36）", entry.Display);
+
+        // 2.0 新字段：新格式可读回
+        string json20 = "[{\"title\":\"窗台上的白猫\",\"content\":\"cat\",\"source\":\"原文\",\"time\":\"2026-10-03 21:30\","
+            + "\"imagePath\":\"D:\\\\Pictures\\\\cat.png\",\"thumbFile\":\"3f2ac1b6e8d24b0f9c7a5e1d2b3c4a55.png\",\"isPony\":true}]";
+        List<SavedEntry> entries20 = JsonUtil.Deserialize<List<SavedEntry>>(json20);
+        Check("saved.json 2.0 新字段可反序列化",
+            entries20 != null && entries20.Count == 1
+            && entries20[0].imagePath == "D:\\Pictures\\cat.png"
+            && entries20[0].thumbFile == "3f2ac1b6e8d24b0f9c7a5e1d2b3c4a55.png"
+            && entries20[0].isPony,
+            entries20 == null || entries20.Count == 0 ? "解析失败" : Escape(entries20[0].imagePath + "|" + entries20[0].thumbFile));
+
+        // 旧格式缺 2.0 字段时补齐默认
+        SavedEntry legacy = old[0];
+        Check("旧记录的 imagePath 补空串", legacy.imagePath == null || legacy.imagePath == "", "非空");
+        Check("旧记录的 thumbFile 补空串", legacy.thumbFile == null || legacy.thumbFile == "", "非空");
+        Check("旧记录的 isPony 为 false", !legacy.isPony, "为 true");
+
+        // 序列化包含 2.0 字段
+        string roundTrip20 = JsonUtil.Serialize(entries20);
+        Check("imagePath / thumbFile / isPony 参与序列化",
+            roundTrip20.IndexOf("\"imagePath\"") >= 0 && roundTrip20.IndexOf("\"thumbFile\"") >= 0
+            && roundTrip20.IndexOf("\"isPony\":true") >= 0, roundTrip20);
+
+        // <Pony> 前缀只作用于列表显示
+        SavedEntry pony = new SavedEntry();
+        pony.title = "窗前看书的女孩";
+        pony.time = "2026-10-03 21:30";
+        pony.isPony = true;
+        Check("Pony 记录标题带 <Pony> 前缀",
+            pony.Display == "<Pony> 窗前看书的女孩（2026-10-03 21:30）", pony.Display);
+
+        SavedEntry normal = new SavedEntry();
+        normal.title = "窗前看书的女孩";
+        normal.time = "2026-10-03 21:30";
+        Check("非 Pony 记录无前缀",
+            normal.Display == "窗前看书的女孩（2026-10-03 21:30）", normal.Display);
+
+        SavedEntry ponyNoTitle = new SavedEntry();
+        ponyNoTitle.time = "2026-10-03 21:30";
+        ponyNoTitle.isPony = true;
+        Check("Pony 且无标题时前缀仍在前",
+            ponyNoTitle.Display == "<Pony> 无标题（2026-10-03 21:30）", ponyNoTitle.Display);
+
+        SavedEntry rename = new SavedEntry();
+        rename.title = "旧标题";
+        rename.time = "2026-10-03 21:30";
+        rename.isPony = true;
+        rename.title = "新标题";
+        Check("修改标题后列表显示同步更新",
+            rename.Display == "<Pony> 新标题（2026-10-03 21:30）", rename.Display);
+        Check("修改标题不改动保存时间",
+            rename.Display.IndexOf("（2026-10-03 21:30）") >= 0, rename.Display);
+        Check("修改标题不改动 Pony 前缀",
+            rename.Display.StartsWith("<Pony> "), rename.Display);
+        Check("修改标题后 title 字段只存用户文字",
+            JsonUtil.Serialize(rename).IndexOf("\"title\":\"新标题\"") >= 0, JsonUtil.Serialize(rename));
+
+        // 可编辑标题必须只是 title 原文：不得混入派生的 <Pony> 前缀与保存时间（
+        // 否则改名会把前缀/时间戳重复写进 title 字段）
+        Check("可编辑标题等于 title 原文",
+            pony.EditableTitle == "窗前看书的女孩", Escape(pony.EditableTitle));
+        Check("可编辑标题不含 <Pony> 前缀",
+            pony.EditableTitle.IndexOf("<Pony>") < 0, Escape(pony.EditableTitle));
+        Check("可编辑标题不含保存时间",
+            pony.EditableTitle.IndexOf("2026-10-03 21:30") < 0, Escape(pony.EditableTitle));
+        Check("可编辑标题与列表显示文本不同",
+            pony.EditableTitle != pony.Display, Escape(pony.EditableTitle));
+        Check("无标题记录的可编辑标题为空串",
+            ponyNoTitle.EditableTitle == string.Empty, Escape(ponyNoTitle.EditableTitle));
+        Check("可编辑标题为派生属性，不写入 saved.json",
+            JsonUtil.Serialize(pony).IndexOf("EditableTitle") < 0, JsonUtil.Serialize(pony));
+
+        Check("title / content 字段不含 <Pony> 前缀",
+            JsonUtil.Serialize(pony).IndexOf("<Pony>") < 0, JsonUtil.Serialize(pony));
+    }
+
+    #endregion
+
+    #region config.json 结构
+
+    private static void ConfigTests()
+    {
+        AppConfig fresh = new AppConfig();
+        Check("新建配置的 schemaVersion 为 0（用于识别旧配置）",
+            fresh.schemaVersion == 0, fresh.schemaVersion.ToString());
+        Check("新建配置带 viewWindow 默认值",
+            fresh.viewWindow != null
+            && fresh.viewWindow.width == Defaults.ViewWindowWidth
+            && fresh.viewWindow.height == Defaults.ViewWindowHeight,
+            "缺失");
+        Check("viewWindow 默认分栏值",
+            fresh.viewWindow.listWidth == 300 && fresh.viewWindow.sourceHeight == 280,
+            fresh.viewWindow.listWidth + "/" + fresh.viewWindow.sourceHeight);
+        Check("新建配置的字号默认为基准字号",
+            fresh.fontSize == Defaults.FontSizeBase, fresh.fontSize.ToString());
+
+        // 旧 config.json：无 schemaVersion、无 viewWindow
+        AppConfig legacy = JsonUtil.Deserialize<AppConfig>(
+            "{\"keyName\":\"DeepSeek\",\"model\":\"deepseek-flash\",\"thinking\":\"disabled\","
+            + "\"window\":{\"x\":10,\"y\":20,\"width\":920,\"height\":640}}");
+        Check("旧 config.json 可反序列化且 schemaVersion 视为 0",
+            legacy != null && legacy.schemaVersion == 0, "取值异常");
+        legacy.Normalize();
+        Check("旧 config.json 自动补齐 viewWindow",
+            legacy.viewWindow != null && legacy.viewWindow.width == Defaults.ViewWindowWidth,
+            "未补齐");
+        Check("旧 config.json 自动补齐字号（回落基准）",
+            legacy.fontSize == Defaults.FontSizeBase, legacy.fontSize.ToString());
+        Check("旧 config.json 的 window 几何保持",
+            legacy.window.x == 10 && legacy.window.y == 20
+            && legacy.window.width == 920 && legacy.window.height == 640,
+            "被改动");
+
+        // 非法/过小值钳制
+        AppConfig small = new AppConfig();
+        small.window.width = 500;
+        small.window.height = 300;
+        small.viewWindow.width = 100;
+        small.viewWindow.height = 100;
+        small.viewWindow.listWidth = 0;
+        small.viewWindow.sourceHeight = -5;
+        small.Normalize();
+        Check("主窗口几何小于最小值时回退默认",
+            small.window.width == Defaults.WindowWidth && small.window.height == Defaults.WindowHeight,
+            small.window.width + "x" + small.window.height);
+        Check("查看窗口几何小于最小值时回退默认",
+            small.viewWindow.width == Defaults.ViewWindowWidth && small.viewWindow.height == Defaults.ViewWindowHeight,
+            small.viewWindow.width + "x" + small.viewWindow.height);
+        Check("分栏非法值回退默认",
+            small.viewWindow.listWidth == 300 && small.viewWindow.sourceHeight == 280,
+            small.viewWindow.listWidth + "/" + small.viewWindow.sourceHeight);
+
+        // 字号非法值钳制
+        AppConfig oddFont = new AppConfig();
+        oddFont.fontSize = 100;
+        oddFont.Normalize();
+        Check("字号超上限时钳制到上限",
+            oddFont.fontSize == Defaults.FontSizeMax, oddFont.fontSize.ToString());
+        oddFont.fontSize = -3;
+        oddFont.Normalize();
+        Check("字号为负数时回落基准",
+            oddFont.fontSize == Defaults.FontSizeBase, oddFont.fontSize.ToString());
+
+        // 序列化包含 2.0 新键
+        string json = JsonUtil.Serialize(new AppConfig());
+        Check("config.json 含 schemaVersion、viewWindow 与 fontSize",
+            json.IndexOf("\"schemaVersion\"") >= 0 && json.IndexOf("\"viewWindow\"") >= 0
+            && json.IndexOf("\"fontSize\"") >= 0, json);
+        Check("viewWindow 的派生属性不入 JSON", json.IndexOf("HasPosition") < 0, json);
+
+        // 升级重置判定：必须只在「文件不存在」或「旧版本配置」时为 true，
+        // 否则会出现「每次启动都重置用户的 prompt.txt」这类严重回归
+        Check("提示词重置：文件不存在时写入默认（全新安装）",
+            Storage.ShouldResetPrompt(false, 0) && Storage.ShouldResetPrompt(false, Defaults.SchemaVersion), "判定错误");
+        Check("提示词重置：旧版本配置（schemaVersion=0）",
+            Storage.ShouldResetPrompt(true, 0), "未触发升级重置");
+        Check("提示词重置：旧版本配置（schemaVersion=1）",
+            Storage.ShouldResetPrompt(true, 1), "未触发升级重置");
+        Check("提示词重置：已达当前版本（=2）不重置",
+            !Storage.ShouldResetPrompt(true, Defaults.SchemaVersion), "会误重置用户提示词");
+        Check("提示词重置：更高版本不重置",
+            !Storage.ShouldResetPrompt(true, Defaults.SchemaVersion + 1), "会误重置用户提示词");
+    }
+
+    #endregion
+
+    #region 额外指令 / Pony Mode 标签
+
+    private static void TagTests()
+    {
+        string tag = Defaults.ExtraInstructionTag;
+        string pony = Defaults.PonyModeTag;
+
+        // 追加额外指令
+        Check("额外指令：空文本直接写入标签",
+            Defaults.AppendExtraInstruction("") == tag + " ", Escape(Defaults.AppendExtraInstruction("")));
+        Check("额外指令：null 安全",
+            Defaults.AppendExtraInstruction(null) == tag + " ", "异常");
+        Check("额外指令：已有内容用空行分隔",
+            Defaults.AppendExtraInstruction("白猫") == "白猫\r\n\r\n" + tag + " ",
+            Escape(Defaults.AppendExtraInstruction("白猫")));
+
+        string once = Defaults.AppendExtraInstruction("白猫");
+        Check("额外指令：已含标签不重复追加",
+            Defaults.AppendExtraInstruction(once) == once, Escape(Defaults.AppendExtraInstruction(once)));
+
+        string withPony = "白猫\r\n\r\n" + pony;
+        string both = Defaults.AppendExtraInstruction(withPony);
+        Check("额外指令：Pony 已勾选时插入其上方",
+            both == "白猫\r\n\r\n" + tag + " \r\n\r\n" + pony, Escape(both));
+
+        // 移除额外指令
+        Check("额外指令：无 Pony 时删除到文本末尾",
+            Defaults.RemoveExtraInstruction(once) == "白猫", Escape(Defaults.RemoveExtraInstruction(once)));
+        Check("额外指令：有 Pony 时只删到 Pony 段之前",
+            Defaults.RemoveExtraInstruction(both) == "白猫\r\n\r\n" + pony,
+            Escape(Defaults.RemoveExtraInstruction(both)));
+        Check("额外指令：文本中无标签时原样返回（不破坏用户内容）",
+            Defaults.RemoveExtraInstruction("白猫") == "白猫", Escape(Defaults.RemoveExtraInstruction("白猫")));
+        Check("额外指令：空文本安全", Defaults.RemoveExtraInstruction("") == "", "异常");
+        // 手工把 Pony 段调到额外指令之前时，不得复制 Pony 段、也不得残留额外指令段
+        Check("额外指令：Pony 段在前时仍只删除额外指令段",
+            Defaults.RemoveExtraInstruction(pony + "\r\n\r\n" + tag + " x") == pony,
+            Escape(Defaults.RemoveExtraInstruction(pony + "\r\n\r\n" + tag + " x")));
+
+        // Pony Mode
+        Check("Pony：空文本直接写入标签",
+            Defaults.AppendPonyMode("") == pony, Escape(Defaults.AppendPonyMode("")));
+        // 按方案 8.3 伪代码，追加前先 TrimEnd()，因此「<额外指令>: 」末尾的占位空格会被去除
+        Check("Pony：追加到末尾且位于额外指令下方",
+            Defaults.AppendPonyMode(once) == "白猫\r\n\r\n" + tag + "\r\n\r\n" + pony,
+            Escape(Defaults.AppendPonyMode(once)));
+        Check("Pony：追加后标签仍位于额外指令下方（位置关系）",
+            Defaults.AppendPonyMode(once).IndexOf(tag) < Defaults.AppendPonyMode(once).IndexOf(pony),
+            Escape(Defaults.AppendPonyMode(once)));
+        Check("Pony：已含标签不重复追加",
+            Defaults.AppendPonyMode(withPony) == withPony, "重复追加");
+        Check("Pony：取消时从标签行首截断",
+            Defaults.RemovePonyMode(both) == "白猫\r\n\r\n" + tag.TrimEnd(),
+            Escape(Defaults.RemovePonyMode(both)));
+        Check("Pony：文本中无标签时原样返回",
+            Defaults.RemovePonyMode("白猫") == "白猫", "异常");
+
+        // 标签位于行中（非独占一行）时的 best-effort 行为
+        string inline = "白猫" + tag + " 改成银白色";
+        Check("额外指令：标签非行首时按行首定位删除",
+            Defaults.RemoveExtraInstruction(inline) == "", Escape(Defaults.RemoveExtraInstruction(inline)));
+
+        // LineStart
+        Check("LineStart 首行返回 0", Defaults.LineStart("abc\ndef", 0) == 0, Defaults.LineStart("abc\ndef", 0).ToString());
+        Check("LineStart 第二行返回行首", Defaults.LineStart("abc\ndef", 5) == 4, Defaults.LineStart("abc\ndef", 5).ToString());
+        Check("LineStart 越界索引安全", Defaults.LineStart("abc", 99) == 0, Defaults.LineStart("abc", 99).ToString());
+        Check("LineStart 空文本安全", Defaults.LineStart("", 0) == 0, "异常");
+
+        // Pony 判定（生成时快照口径）
+        Check("ContainsPonyMode 判定含标签文本", Defaults.ContainsPonyMode("白猫\r\n\r\n" + pony), "未识别");
+        Check("ContainsPonyMode 对普通文本返回 false", !Defaults.ContainsPonyMode("白猫"), "误判");
+        Check("ContainsExtraInstruction 判定", Defaults.ContainsExtraInstruction(once), "未识别");
     }
 
     #endregion
@@ -343,16 +663,16 @@ internal static class TestMain
         bool bok6 = (bool)InvokePrivate("TryParseBalance", b6);
         Check("数字型金额不崩溃", bok6 && ((string)b6[1]) == "\uFFE5110", bok6 ? (string)b6[1] : (string)b6[2]);
 
-        // 请求体：思考模式开关
+        // 请求体：思考模式开关（无图片）
         DeepSeekClient off = new DeepSeekClient("sk-x", "deepseek-flash", "disabled");
-        Dictionary<string, object> offBody = (Dictionary<string, object>)InvokeInstance(off, "BuildChatBody", new object[] { "SYS", "用户输入" });
+        Dictionary<string, object> offBody = (Dictionary<string, object>)InvokeInstance(off, "BuildChatBody", new object[] { "SYS", "用户输入", null });
         Dictionary<string, object> offThinking = offBody["thinking"] as Dictionary<string, object>;
         Check("disabled 模式 thinking.type=disabled",
             offThinking != null && JsonUtil.GetString(offThinking, "type") == "disabled", "结构异常");
         Check("disabled 模式不发送 reasoning_effort", !offBody.ContainsKey("reasoning_effort"), "含该字段");
 
         DeepSeekClient on = new DeepSeekClient("sk-x", "deepseek-flash", "max");
-        Dictionary<string, object> onBody = (Dictionary<string, object>)InvokeInstance(on, "BuildChatBody", new object[] { "SYS", "用户输入" });
+        Dictionary<string, object> onBody = (Dictionary<string, object>)InvokeInstance(on, "BuildChatBody", new object[] { "SYS", "用户输入", null });
         Dictionary<string, object> onThinking = onBody["thinking"] as Dictionary<string, object>;
         Check("max 模式 thinking.type=enabled",
             onThinking != null && JsonUtil.GetString(onThinking, "type") == "enabled", "结构异常");
@@ -361,7 +681,7 @@ internal static class TestMain
 
         // 非法思考模式值被归一化为 disabled
         DeepSeekClient bad = new DeepSeekClient("sk-x", "deepseek-flash", "ultra");
-        Dictionary<string, object> badBody = (Dictionary<string, object>)InvokeInstance(bad, "BuildChatBody", new object[] { "SYS", "x" });
+        Dictionary<string, object> badBody = (Dictionary<string, object>)InvokeInstance(bad, "BuildChatBody", new object[] { "SYS", "x", null });
         Dictionary<string, object> badThinking = badBody["thinking"] as Dictionary<string, object>;
         Check("非法思考模式归一化为 disabled",
             badThinking != null && JsonUtil.GetString(badThinking, "type") == "disabled", "未归一化");
@@ -383,6 +703,289 @@ internal static class TestMain
             throw new InvalidOperationException("找不到私有方法 " + name);
         }
         return mi.Invoke(instance, args);
+    }
+
+    #endregion
+
+    #region 图片请求体
+
+    private static void ImageRequestTests()
+    {
+        DeepSeekClient client = new DeepSeekClient("sk-x", "deepseek-flash", "disabled");
+        byte[] png = new byte[] { 0x89, 0x50, 0x4E, 0x47 };
+        ImagePayload payload = new ImagePayload(png, "image/png");
+        string dataUrl = "data:image/png;base64," + Convert.ToBase64String(png);
+
+        // 无图片：content 仍为字符串（与 1.x 逐字节一致）
+        Dictionary<string, object> noImage = (Dictionary<string, object>)InvokeInstance(
+            client, "BuildChatBody", new object[] { "SYS", "白猫", null });
+        IList msgs = noImage["messages"] as IList;
+        object noImageContent = (msgs[1] as Dictionary<string, object>)["content"];
+        Check("无图片时 user.content 为字符串",
+            noImageContent is string && (string)noImageContent == "白猫", "类型或内容不符");
+
+        // 有图片 + 文本
+        Dictionary<string, object> withImage = (Dictionary<string, object>)InvokeInstance(
+            client, "BuildChatBody", new object[] { "SYS", "白猫", payload });
+        IList msgs2 = withImage["messages"] as IList;
+        Check("含图片时 messages 仍为两条", msgs2 != null && msgs2.Count == 2, "结构异常");
+        object systemContent = (msgs2[0] as Dictionary<string, object>)["content"];
+        Check("system.content 始终为字符串（图片不入 system）", systemContent is string, "类型不符");
+
+        IList blocks = (msgs2[1] as Dictionary<string, object>)["content"] as IList;
+        Check("含图片时 user.content 为内容块数组", blocks != null && blocks.Count == 2, "结构异常");
+        if (blocks != null && blocks.Count == 2)
+        {
+            Dictionary<string, object> b0 = blocks[0] as Dictionary<string, object>;
+            Dictionary<string, object> b1 = blocks[1] as Dictionary<string, object>;
+            Check("文本块在前",
+                JsonUtil.GetString(b0, "type") == "text" && JsonUtil.GetString(b0, "text") == "白猫", "结构异常");
+            Check("image_url 块在后", JsonUtil.GetString(b1, "type") == "image_url", "结构异常");
+
+            Dictionary<string, object> imageUrl = b1["image_url"] as Dictionary<string, object>;
+            Check("data URL 形如 data:image/png;base64,...",
+                imageUrl != null && JsonUtil.GetString(imageUrl, "url") == dataUrl,
+                JsonUtil.GetString(imageUrl, "url"));
+            Check("图片块不传 detail（块与对象两层都不得出现）",
+                !b1.ContainsKey("detail") && imageUrl != null && !imageUrl.ContainsKey("detail"), "被传入了");
+        }
+
+        // 仅图片（文本为空）：只有 image_url 块
+        Dictionary<string, object> onlyImage = (Dictionary<string, object>)InvokeInstance(
+            client, "BuildChatBody", new object[] { "SYS", "", payload });
+        IList msgs3 = onlyImage["messages"] as IList;
+        IList blocks3 = (msgs3[1] as Dictionary<string, object>)["content"] as IList;
+        Check("仅图片时只含 image_url 块",
+            blocks3 != null && blocks3.Count == 1
+            && JsonUtil.GetString(blocks3[0] as Dictionary<string, object>, "type") == "image_url",
+            "结构异常");
+
+        // 空载荷（无字节）按无图片处理
+        Dictionary<string, object> emptyPayload = (Dictionary<string, object>)InvokeInstance(
+            client, "BuildChatBody", new object[] { "SYS", "白猫", new ImagePayload(new byte[0], "image/png") });
+        IList msgs4 = emptyPayload["messages"] as IList;
+        Check("空载荷按无图片处理（content 为字符串）",
+            (msgs4[1] as Dictionary<string, object>)["content"] is string, "变成了数组");
+
+        // 序列化后仍是嵌套数组 + data URL
+        string json = JsonUtil.Serialize(withImage);
+        Check("请求体序列化含 image_url 与 data URL",
+            json.IndexOf("\"image_url\"") >= 0 && json.IndexOf("data:image/png;base64,") >= 0,
+            json.Substring(0, Math.Min(160, json.Length)));
+
+        // 回读时嵌套数组为 ArrayList（守 IList 约定）
+        Dictionary<string, object> back;
+        JsonUtil.TryDeserializeObject(json, out back);
+        IList backMsgs = back["messages"] as IList;
+        IList backBlocks = (backMsgs[1] as Dictionary<string, object>)["content"] as IList;
+        Check("含图片请求体可回读为嵌套数组",
+            backBlocks != null && backBlocks.Count == 2
+            && JsonUtil.GetString(backBlocks[1] as Dictionary<string, object>, "type") == "image_url",
+            "结构异常");
+    }
+
+    #endregion
+
+    #region ImageUtil
+
+    private static void ImageUtilTests()
+    {
+        // 扩展名过滤
+        Check("支持 jpg/jpeg/png/webp/bmp",
+            ImageUtil.IsSupportedExtensionValue(".jpg") && ImageUtil.IsSupportedExtensionValue(".JPEG")
+            && ImageUtil.IsSupportedExtensionValue(".png") && ImageUtil.IsSupportedExtensionValue(".webp")
+            && ImageUtil.IsSupportedExtensionValue(".bmp"), "判定失败");
+        Check("不支持 gif/txt/无扩展名",
+            !ImageUtil.IsSupportedExtensionValue(".gif") && !ImageUtil.IsSupportedExtensionValue(".txt")
+            && !ImageUtil.IsSupportedExtensionValue(""), "误判");
+
+        // 缩略图文件名格式
+        string name = ImageUtil.NewThumbFileName();
+        Check("缩略图文件名为 32 位十六进制 + .png",
+            Regex.IsMatch(name, "^[0-9a-f]{32}\\.png$"), name);
+        Check("缩略图文件名各不相同", ImageUtil.NewThumbFileName() != name, "重复");
+
+        // 删除辅助对空值安全
+        ImageUtil.TryDeleteThumb(null);
+        ImageUtil.TryDeleteThumb("");
+        ImageUtil.TryDeleteThumb("..\\..\\evil.png");
+        Check("删除辅助对 null / 空 / 穿越路径不抛异常", true, "");
+
+        string dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tmp-image");
+        if (Directory.Exists(dir))
+        {
+            Directory.Delete(dir, true);
+        }
+        Directory.CreateDirectory(dir);
+
+        try
+        {
+            // 不支持的扩展名
+            string gif = Path.Combine(dir, "note.gif");
+            File.WriteAllBytes(gif, new byte[] { 1, 2, 3 });
+            ImagePayload gifPayload;
+            string gifError;
+            bool gifOk = ImageUtil.LoadForUpload(gif, out gifPayload, out gifError);
+            Check("不支持的扩展名被拒绝并给出提示",
+                !gifOk && gifError == ImageUtil.UnsupportedFormatMessage, gifError);
+
+            // 超过 32 MiB（稀疏文件，不实际占用磁盘）
+            string big = Path.Combine(dir, "big.png");
+            using (FileStream fs = new FileStream(big, FileMode.Create, FileAccess.Write))
+            {
+                fs.SetLength((long)Defaults.MaxImageBytes + 1);
+            }
+            ImagePayload bigPayload;
+            string bigError;
+            bool bigOk = ImageUtil.LoadForUpload(big, out bigPayload, out bigError);
+            Check("超过 32MiB 的图片被拒绝并给出提示",
+                !bigOk && bigError == ImageUtil.TooLargeMessage, bigError);
+            File.Delete(big);
+
+            // 文件不存在
+            ImagePayload missing;
+            string missingError;
+            Check("文件不存在时安全失败",
+                !ImageUtil.LoadForUpload(Path.Combine(dir, "nope.png"), out missing, out missingError)
+                && missingError.Length > 0, missingError);
+
+            // BMP -> PNG
+            string bmpPath = Path.Combine(dir, "tiny.bmp");
+            using (Bitmap bmp = new Bitmap(60, 40))
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.Red);
+                }
+                bmp.Save(bmpPath, ImageFormat.Bmp);
+            }
+            ImagePayload bmpPayload;
+            string bmpError;
+            bool bmpOk = ImageUtil.LoadForUpload(bmpPath, out bmpPayload, out bmpError);
+            Check("BMP 被转码为 PNG（MIME 与魔数）",
+                bmpOk && bmpPayload.MimeType == "image/png" && bmpPayload.Length > 8
+                && bmpPayload.Data[0] == 0x89 && bmpPayload.Data[1] == 0x50
+                && bmpPayload.Data[2] == 0x4E && bmpPayload.Data[3] == 0x47,
+                bmpError.Length > 0 ? bmpError : bmpPayload == null ? "无载荷" : bmpPayload.MimeType);
+
+            // JPEG 原样字节
+            string jpgPath = Path.Combine(dir, "tiny.jpg");
+            using (Bitmap bmp = new Bitmap(30, 30))
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.Green);
+                }
+                bmp.Save(jpgPath, ImageFormat.Jpeg);
+            }
+            ImagePayload jpgPayload;
+            string jpgError;
+            bool jpgOk = ImageUtil.LoadForUpload(jpgPath, out jpgPayload, out jpgError);
+            Check("JPEG 原样上传（MIME + 字节不变）",
+                jpgOk && jpgPayload.MimeType == "image/jpeg"
+                && jpgPayload.Length == File.ReadAllBytes(jpgPath).Length,
+                jpgError);
+
+            // WebP 原样字节（GDI+ 不参与编解码）
+            string webpPath = Path.Combine(dir, "fake.webp");
+            File.WriteAllBytes(webpPath, new byte[] { 0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0 });
+            ImagePayload webpPayload;
+            string webpError;
+            bool webpOk = ImageUtil.LoadForUpload(webpPath, out webpPayload, out webpError);
+            Check("WebP 原样上传（MIME image/webp）",
+                webpOk && webpPayload.MimeType == "image/webp", webpError);
+
+            // 缩略图：横图 1000×400 -> 250×100
+            string wideSrc = Path.Combine(dir, "wide.png");
+            using (Bitmap bmp = new Bitmap(1000, 400))
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.Blue);
+                }
+                bmp.Save(wideSrc, ImageFormat.Png);
+            }
+            string wideThumb = Path.Combine(dir, "wide-thumb.png");
+            bool wideOk = ImageUtil.TryCreateThumbnail(wideSrc, wideThumb);
+            int wideW = 0;
+            int wideH = 0;
+            if (wideOk)
+            {
+                using (Image img = Image.FromFile(wideThumb))
+                {
+                    wideW = img.Width;
+                    wideH = img.Height;
+                }
+            }
+            Check("横图缩略图等比缩放为 250×100（不超过 250×200）",
+                wideOk && wideW == 250 && wideH == 100, wideW + "x" + wideH);
+
+            // 缩略图：竖图 400×800 -> 100×200
+            string tallSrc = Path.Combine(dir, "tall.png");
+            using (Bitmap bmp = new Bitmap(400, 800))
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.Blue);
+                }
+                bmp.Save(tallSrc, ImageFormat.Png);
+            }
+            string tallThumb = Path.Combine(dir, "tall-thumb.png");
+            bool tallOk = ImageUtil.TryCreateThumbnail(tallSrc, tallThumb);
+            int tallW = 0;
+            int tallH = 0;
+            if (tallOk)
+            {
+                using (Image img = Image.FromFile(tallThumb))
+                {
+                    tallW = img.Width;
+                    tallH = img.Height;
+                }
+            }
+            Check("竖图缩略图等比缩放为 100×200",
+                tallOk && tallW == 100 && tallH == 200, tallW + "x" + tallH);
+
+            // 原图缺失时缩略图失败但不抛异常
+            Check("原图缺失时缩略图生成安全失败",
+                !ImageUtil.TryCreateThumbnail(Path.Combine(dir, "nope.png"), Path.Combine(dir, "x.png")),
+                "竟然成功");
+
+            // 预览解码
+            ImagePayload previewPayload;
+            string previewLoadError;
+            ImageUtil.LoadForUpload(wideSrc, out previewPayload, out previewLoadError);
+            ImagePreview preview;
+            string previewError;
+            bool previewOk = ImageUtil.TryCreatePreview(previewPayload, out preview, out previewError);
+            Check("PNG 可建立界面预览",
+                previewOk && preview != null && preview.Image.Width == 1000, previewError);
+            if (previewOk && preview != null)
+            {
+                preview.Dispose();
+            }
+
+            // WebP（GDI+ 无法解码）时预览失败但不抛异常，且不影响上传
+            ImagePreview webpPreview;
+            string webpPreviewError;
+            bool webpPreviewOk = ImageUtil.TryCreatePreview(webpPayload, out webpPreview, out webpPreviewError);
+            Check("WebP 预览失败但不影响上传（返回 false）",
+                !webpPreviewOk && webpPreviewError.Length > 0, "竟然成功");
+            if (webpPreviewOk && webpPreview != null)
+            {
+                webpPreview.Dispose();
+            }
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(dir, true);
+            }
+            catch (Exception)
+            {
+                // 清理失败不影响测试结论
+            }
+        }
     }
 
     #endregion
@@ -410,6 +1013,79 @@ internal static class TestMain
             !(bool)miTransport.Invoke(null, new object[] { System.Net.WebExceptionStatus.Timeout }), "yes");
         Check("TrustFailure 不重试",
             !(bool)miTransport.Invoke(null, new object[] { System.Net.WebExceptionStatus.TrustFailure }), "yes");
+    }
+
+    #endregion
+
+    #region 保存列表的删除（写盘失败时内存列表不得被改动）
+
+    private static void RemoveEntryTests()
+    {
+        List<SavedEntry> entries = new List<SavedEntry>();
+        for (int i = 0; i < 3; i++)
+        {
+            SavedEntry e = new SavedEntry();
+            e.title = ((char)('A' + i)).ToString();
+            e.content = "prompt-" + e.title;
+            entries.Add(e);
+        }
+
+        List<SavedEntry> remaining = Storage.RemoveEntryAt(entries, 1);
+        Check("删除中间记录：新列表不含该记录且长度减一",
+            remaining.Count == 2 && remaining[0].title == "A" && remaining[1].title == "C",
+            remaining.Count + " 条");
+        Check("删除后原列表保持原样（写盘失败时内存与界面才不会错位）",
+            entries.Count == 3 && entries[0].title == "A" && entries[1].title == "B" && entries[2].title == "C",
+            entries.Count + " 条");
+        Check("删除返回新列表而非原列表",
+            !object.ReferenceEquals(entries, remaining), "引用了同一个对象");
+        Check("删除第一条",
+            Storage.RemoveEntryAt(entries, 0)[0].title == "B", "结果异常");
+        Check("删除最后一条",
+            Storage.RemoveEntryAt(entries, 2)[1].title == "B", "结果异常");
+        Check("越界下标不得误删",
+            Storage.RemoveEntryAt(entries, 3).Count == 3 && Storage.RemoveEntryAt(entries, -1).Count == 3,
+            "长度被改动");
+        Check("空列表与 null 安全",
+            Storage.RemoveEntryAt(new List<SavedEntry>(), 0).Count == 0
+            && Storage.RemoveEntryAt(null, 0).Count == 0, "抛异常或返回异常值");
+
+        // TryRemoveEntryAt：写盘成功才提交（删除流程的顺序性质由它守护）
+        List<SavedEntry> committed;
+        string error;
+        bool ok = Storage.TryRemoveEntryAt(entries, 1, FailSaver, out committed, out error);
+        Check("写盘失败：TryRemoveEntryAt 返回 false 且带出原因",
+            !ok && error.Length > 0, ok + " / " + Escape(error));
+        Check("写盘失败：不交出提交结果", committed == null, "committed 非 null");
+        Check("写盘失败：原列表仍为 3 条（修复前此处会被改掉，导致行号错位）",
+            entries.Count == 3 && entries[1].title == "B", entries.Count + " 条");
+
+        Check("未提供写盘委托时按失败处理",
+            !Storage.TryRemoveEntryAt(entries, 1, null, out committed, out error) && committed == null,
+            "返回了成功");
+
+        _savedForWrite = null;
+        ok = Storage.TryRemoveEntryAt(entries, 1, RecordSaver, out committed, out error);
+        Check("写盘成功：交出移除后的新列表",
+            ok && committed != null && committed.Count == 2
+            && committed[0].title == "A" && committed[1].title == "C",
+            ok + " / " + (committed == null ? "<null>" : committed.Count.ToString()));
+        Check("写盘成功：交给写盘的与交出的是同一份新列表",
+            object.ReferenceEquals(_savedForWrite, committed), "不是同一对象");
+        Check("写盘成功：原列表仍未被改动（由调用方替换引用）",
+            entries.Count == 3 && entries[1].title == "B", entries.Count + " 条");
+    }
+
+    private static List<SavedEntry> _savedForWrite;
+
+    private static void FailSaver(List<SavedEntry> entries)
+    {
+        throw new IOException("模拟写盘失败");
+    }
+
+    private static void RecordSaver(List<SavedEntry> entries)
+    {
+        _savedForWrite = entries;
     }
 
     #endregion

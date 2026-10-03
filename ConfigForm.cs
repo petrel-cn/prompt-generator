@@ -17,6 +17,7 @@ namespace PromptGenerator
         private CheckBox _chkShowKey;
         private TextBox _txtModel;
         private ComboBox _cboThinking;
+        private ComboBox _cboFontSize;
         private TextBox _txtPrompt;
         private Label _lblHint;
 
@@ -48,6 +49,24 @@ namespace PromptGenerator
             }
         }
 
+        /// <summary>字号下拉项。</summary>
+        private class FontSizeOption
+        {
+            public int Value;
+            public string Text;
+
+            public FontSizeOption(int value, string text)
+            {
+                Value = value;
+                Text = text;
+            }
+
+            public override string ToString()
+            {
+                return Text;
+            }
+        }
+
         public ConfigForm()
         {
             _promptTextSnapshot = string.Empty;
@@ -59,7 +78,7 @@ namespace PromptGenerator
         private void BuildUi()
         {
             Text = "配置";
-            ClientSize = new Size(640, 620);
+            ClientSize = new Size(640, 660);
             MinimumSize = new Size(560, 480);
             StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = false;
@@ -104,14 +123,27 @@ namespace PromptGenerator
             _cboThinking.Items.Add(new ThinkingOption(Defaults.ThinkingHigh, "高（high）"));
             _cboThinking.Items.Add(new ThinkingOption(Defaults.ThinkingMax, "最高（max）"));
 
-            Label lblPrompt = MakeLabel("系统提示词", 12, 151);
+            Label lblFontSize = MakeLabel("字体大小", 12, 151);
+            _cboFontSize = new ComboBox();
+            _cboFontSize.DropDownStyle = ComboBoxStyle.DropDownList;
+            _cboFontSize.Location = new Point(96, 148);
+            _cboFontSize.Size = new Size(300, 24);
+            _cboFontSize.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+            for (int i = 0; i < Defaults.FontSizeOptionCount; i++)
+            {
+                int size = Defaults.FontSizeBase + i;
+                _cboFontSize.Items.Add(new FontSizeOption(size, Defaults.FontSizeDisplayName(size)));
+            }
+
+            Label lblPrompt = MakeLabel("系统提示词", 12, 185);
             lblPrompt.AutoSize = true;
 
             _lblHint = new Label();
-            _lblHint.Text = "思考模式开启时采样参数不生效；提示词内容由用户自定义，程序不做过滤。";
+            _lblHint.Text = "思考模式开启时采样参数不生效；提示词内容由用户自定义，程序不做过滤。\r\n"
+                + "字体大小只作用于主窗口与查看窗口的「用户输入」「英文提示词」。";
             _lblHint.ForeColor = SystemColors.GrayText;
             _lblHint.AutoSize = true;
-            _lblHint.Location = new Point(96, 153);
+            _lblHint.Location = new Point(96, 187);
             _lblHint.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
 
             _txtPrompt = new TextBox();
@@ -119,27 +151,27 @@ namespace PromptGenerator
             _txtPrompt.ScrollBars = ScrollBars.Vertical;
             _txtPrompt.WordWrap = true;
             _txtPrompt.AcceptsReturn = true;
-            _txtPrompt.Location = new Point(12, 176);
-            _txtPrompt.Size = new Size(616, 388);
+            _txtPrompt.Location = new Point(12, 226);
+            _txtPrompt.Size = new Size(616, 378);
             _txtPrompt.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
 
-            _btnNotepad = MakeButton("用记事本打开", 12, 576, 120);
+            _btnNotepad = MakeButton("用记事本打开", 12, 616, 120);
             _btnNotepad.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnNotepad.Click += OnNotepadClick;
 
-            _btnRestore = MakeButton("恢复默认", 140, 576, 90);
+            _btnRestore = MakeButton("恢复默认", 140, 616, 90);
             _btnRestore.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnRestore.Click += OnRestoreClick;
 
-            _btnTest = MakeButton("测试连接", 238, 576, 90);
+            _btnTest = MakeButton("测试连接", 238, 616, 90);
             _btnTest.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnTest.Click += OnTestClick;
 
-            _btnSave = MakeButton("保存", 460, 576, 80);
+            _btnSave = MakeButton("保存", 460, 616, 80);
             _btnSave.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             _btnSave.Click += OnSaveClick;
 
-            _btnCancel = MakeButton("取消", 548, 576, 80);
+            _btnCancel = MakeButton("取消", 548, 616, 80);
             _btnCancel.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             _btnCancel.DialogResult = DialogResult.Cancel;
             _btnCancel.Click += OnCancelClick;
@@ -153,6 +185,8 @@ namespace PromptGenerator
             Controls.Add(_txtModel);
             Controls.Add(lblThinking);
             Controls.Add(_cboThinking);
+            Controls.Add(lblFontSize);
+            Controls.Add(_cboFontSize);
             Controls.Add(lblPrompt);
             Controls.Add(_lblHint);
             Controls.Add(_txtPrompt);
@@ -206,6 +240,21 @@ namespace PromptGenerator
                 _cboThinking.SelectedIndex = 0;
             }
 
+            int fontSize = Defaults.NormalizeFontSize(cfg.fontSize);
+            for (int i = 0; i < _cboFontSize.Items.Count; i++)
+            {
+                FontSizeOption option = _cboFontSize.Items[i] as FontSizeOption;
+                if (option != null && option.Value == fontSize)
+                {
+                    _cboFontSize.SelectedIndex = i;
+                    break;
+                }
+            }
+            if (_cboFontSize.SelectedIndex < 0)
+            {
+                _cboFontSize.SelectedIndex = 0;
+            }
+
             try
             {
                 _txtPrompt.Text = Storage.ReadPrompt();
@@ -228,6 +277,16 @@ namespace PromptGenerator
             if (option == null)
             {
                 return Defaults.ThinkingDefault;
+            }
+            return option.Value;
+        }
+
+        private int SelectedFontSize()
+        {
+            FontSizeOption option = _cboFontSize.SelectedItem as FontSizeOption;
+            if (option == null)
+            {
+                return Defaults.FontSizeBase;
             }
             return option.Value;
         }
@@ -415,17 +474,33 @@ namespace PromptGenerator
         private void OnSaveClick(object sender, EventArgs e)
         {
             AppConfig cfg = Storage.Config;
-            cfg.keyName = _txtKeyName.Text.Trim();
-            if (cfg.keyName.Length == 0)
+
+            string keyName = _txtKeyName.Text.Trim();
+            if (keyName.Length == 0)
             {
-                cfg.keyName = Defaults.KeyName;
+                keyName = Defaults.KeyName;
             }
-            cfg.model = _txtModel.Text.Trim();
-            if (cfg.model.Length == 0)
+            string model = _txtModel.Text.Trim();
+            if (model.Length == 0)
             {
-                cfg.model = Defaults.Model;
+                model = Defaults.Model;
             }
-            cfg.thinking = SelectedThinking();
+            string thinking = SelectedThinking();
+            int fontSize = SelectedFontSize();
+
+            // 这几个值必须先落到活配置上：SetApiKey 内部写回的 config.json 就是这份对象。
+            // 因此写盘失败时必须回滚，否则内存里会留着未落盘的值，
+            // 之后任何一次 SaveConfig（如关闭查看窗口写几何）都会把它们静默写进文件，
+            // 与界面提示的「保存配置失败」相矛盾。
+            string oldKeyName = cfg.keyName;
+            string oldModel = cfg.model;
+            string oldThinking = cfg.thinking;
+            int oldFontSize = cfg.fontSize;
+
+            cfg.keyName = keyName;
+            cfg.model = model;
+            cfg.thinking = thinking;
+            cfg.fontSize = fontSize;
 
             try
             {
@@ -435,6 +510,10 @@ namespace PromptGenerator
             }
             catch (Exception ex)
             {
+                cfg.keyName = oldKeyName;
+                cfg.model = oldModel;
+                cfg.thinking = oldThinking;
+                cfg.fontSize = oldFontSize;
                 MessageBox.Show(this, "保存配置失败：" + ex.Message, "配置",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
